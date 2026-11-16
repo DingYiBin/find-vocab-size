@@ -120,26 +120,38 @@ def _extract_text(obj, text_field: str | None) -> str:
 
 # sharegpt "from" -> chat "role"
 SHAREGPT_ROLE = {"human": "user", "gpt": "assistant", "system": "system", "user": "user", "assistant": "assistant", "bing": "assistant"}
+VALID_ROLES = {"user", "assistant", "system", "tool"}
 
 
 def _to_messages(obj) -> list[dict] | None:
-    """Convert a document to chat-template messages, or None if not a conversation."""
+    """Convert a document to chat-template messages, or None if not a conversation.
+
+    Supports:
+      - {"conversations": [{"from": "human", "value": ...}]}   (sharegpt)
+      - {"conversations": [{"role": "user", "content": ...}]}  (openai-style)
+      - {"messages": [{"role": ..., "content": ...}]}           (openai-style)
+    """
     if isinstance(obj, str):
         return [{"role": "user", "content": obj}]
     if not isinstance(obj, dict):
         return None
-    if isinstance(obj.get("conversations"), list):  # sharegpt format
-        msgs = []
-        for turn in obj["conversations"]:
-            if not isinstance(turn, dict) or "value" not in turn:
-                continue
+    raw = obj.get("conversations") if isinstance(obj.get("conversations"), list) else obj.get("messages")
+    if not isinstance(raw, list):
+        return None
+    msgs = []
+    for turn in raw:
+        if not isinstance(turn, dict):
+            continue
+        if "content" in turn:  # openai-style turn
+            role = str(turn.get("role", "user")).lower()
+            role = SHAREGPT_ROLE.get(role, role)
+            if role not in VALID_ROLES:
+                role = "user"
+            msgs.append({"role": role, "content": str(turn["content"])})
+        elif "value" in turn:  # sharegpt-style turn
             role = SHAREGPT_ROLE.get(str(turn.get("from", "")).lower(), "user")
             msgs.append({"role": role, "content": str(turn["value"])})
-        return msgs or None
-    if isinstance(obj.get("messages"), list):  # already openai-style
-        msgs = [t for t in obj["messages"] if isinstance(t, dict) and "content" in t]
-        return msgs or None
-    return None
+    return msgs or None
 
 
 def analyze(
