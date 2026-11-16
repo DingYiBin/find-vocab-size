@@ -1,0 +1,12 @@
+# Local model artifacts (tokenizers, checkpoints)
+models/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Data & analysis outputs
+data/
+*.jsonl
+*.parquet

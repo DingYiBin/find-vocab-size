@@ -1,0 +1,22 @@
+[project]
+name = "find-vocab-size"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Hugo Ding", email = "hugo_ding@yeah.net" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "jinja2>=3.1.6",
+    "tokenizers>=0.23.3",
+    "tqdm>=4.70.1",
+    "transformers>=5.23.0",
+]
+
+[project.scripts]
+find-vocab-size = "find_vocab_size:main"
+
+[build-system]
+requires = ["uv_build>=0.13.1,<0.14.0"]
+build-backend = "uv_build"
