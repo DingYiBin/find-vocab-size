@@ -250,6 +250,56 @@ def coverage_table(ng: NGramStats) -> list[tuple[float, int]]:
     return table
 
 
+def freq_buckets(ng: NGramStats) -> list[dict]:
+    """Bucket distinct n-grams by occurrence-count ranges [2^k, 2^(k+1)).
+
+    Complete coverage: buckets run from [1,2) up to the bucket containing
+    the max count. For each bucket also return cumulative stats for
+    "entries with count >= 2^k" (cum_ge / cum_occ), which is what
+    min-count filtering decisions are based on.
+    """
+    distinct: Counter[int] = Counter()  # k -> #keys in bucket
+    occ: Counter[int] = Counter()  # k -> sum of counts in bucket
+    for c in ng.counter.values():
+        k = max(c, 1).bit_length() - 1  # c in [2^k, 2^(k+1))
+        distinct[k] += 1
+        occ[k] += c
+    if not distinct:
+        return []
+    kmax = max(distinct)
+    cum_ge = {}  # k -> #entries with count >= 2^k
+    cum_occ = {}  # k -> occurrences covered by those entries
+    entries = 0
+    total = 0
+    for k in range(kmax, -1, -1):
+        entries += distinct.get(k, 0)
+        total += occ.get(k, 0)
+        cum_ge[k] = entries
+        cum_occ[k] = total
+    return [
+        {
+            "lo": 1 << k,
+            "hi": 1 << (k + 1),
+            "distinct": distinct.get(k, 0),
+            "occ": occ.get(k, 0),
+            "cum_ge": cum_ge[k],
+            "cum_occ": cum_occ[k],
+        }
+        for k in range(kmax + 1)
+    ]
+
+
+def report_freq_buckets(ng: NGramStats) -> None:
+    print(f"\n  Frequency buckets: count in [2^k, 2^(k+1)), complete coverage")
+    print(f"  {'bucket':>22} {'#distinct':>12} {'occurrences':>12} {'#count>=lo':>12} {'occ coverage':>13}")
+    for r in freq_buckets(ng):
+        cover = 100.0 * r["cum_occ"] / ng.total if ng.total else 0.0
+        print(
+            f"  [{r['lo']:>9,}, {r['hi']:>9,}) "
+            f"{r['distinct']:>12,} {r['occ']:>12,} {r['cum_ge']:>12,} {cover:>12.2f}%"
+        )
+
+
 def report_ngram(ng: NGramStats, stats: Stats, top_k: int = 10) -> None:
     v = stats.tokenizer_vocab
     n = ng.n
@@ -271,6 +321,8 @@ def report_ngram(ng: NGramStats, stats: Stats, top_k: int = 10) -> None:
         text = stats.tok.decode(ids) if stats.tok is not None else str(ids)
         freq = cnt / ng.total if ng.total else 0.0
         print(f"    {cnt:>12,}  ({freq * 100:.2f}%)  {text!r}")
+
+    report_freq_buckets(ng)
 
 
 def main(argv: list[str] | None = None) -> None:
