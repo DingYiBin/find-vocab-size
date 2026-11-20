@@ -16,6 +16,7 @@ dependencies = [
 
 [project.scripts]
 find-vocab-size = "find_vocab_size:main"
+find-vocab-merge = "find_vocab_size.vocab_merge:main"
 
 [build-system]
 requires = ["uv_build>=0.13.1,<0.14.0"]
