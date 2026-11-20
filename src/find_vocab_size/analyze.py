@@ -21,6 +21,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import numpy as np
 from tqdm import tqdm
 
 DEFAULT_TOKENIZER = Path(__file__).resolve().parents[2] / "models" / "Qwen" / "Qwen3-4B" / "tokenizer.json"
@@ -173,6 +174,7 @@ def analyze(
     stats = Stats(n_docs=0, tokenizer_vocab=v, by_n={n: NGramStats(n=n) for n in ngrams}, tok=tok)
 
     merge_lut: list[int] | None = None
+    lut_np: np.ndarray | None = None
     if apply_merge is not None:
         data = json.loads(Path(apply_merge).read_text())
         # identity table, then overwrite merged ids -> canonical id;
@@ -180,6 +182,7 @@ def analyze(
         merge_lut = list(range(v))
         for k, x in data["map"].items():
             merge_lut[int(k)] = int(x)
+        lut_np = np.asarray(merge_lut, dtype=np.int64)
 
     hf_tok = None
     if chat_template:
@@ -221,10 +224,10 @@ def analyze(
         batch.extend(texts)
         stats.n_docs += 1
         if len(batch) >= batch_size:
-            _count_batch(tok, batch, stats, v, merge_lut)
+            _count_batch(tok, batch, stats, v, merge_lut, lut_np)
             batch = []
     if batch:
-        _count_batch(tok, batch, stats, v, merge_lut)
+        _count_batch(tok, batch, stats, v, merge_lut, lut_np)
     if n_skipped:
         print(
             f"[sample] kept {stats.n_docs:,} docs, skipped {n_skipped:,} (rate={sample})",
@@ -233,16 +236,73 @@ def analyze(
     return stats
 
 
-def _count_batch(tok, batch: list[str], stats: Stats, v: int, merge_lut: list[int] | None) -> None:
+def _count_batch(tok, batch: list[str], stats: Stats, v: int, merge_lut, lut_np) -> None:
+    """Batch-tokenize, vectorized-remap, vectorized-pack, then bulk-count.
+
+    All encodings of the batch are concatenated into one int64 array with a
+    -1 sentinel between documents (so n-grams never span documents), remapped
+    through the LUT in one numpy op, packed into n-gram keys with vectorized
+    multiply-adds, and counted with np.unique -- instead of a Python loop per
+    n-gram position. n where v**n would overflow int64 falls back to the
+    per-encoding Python path.
+    """
     encs = tok.encode_batch(batch, add_special_tokens=False)
-    remap = merge_lut.__getitem__ if merge_lut is not None else None
+    if not encs:
+        return
+
+    total = sum(len(e.ids) for e in encs)
+    if total == 0:
+        return
+    arr = np.empty(total + len(encs), dtype=np.int64)  # + 1 sentinel per doc
+    pos = 0
+    for e in encs:
+        l = len(e.ids)
+        arr[pos : pos + l] = e.ids
+        pos += l
+        arr[pos] = -1
+        pos += 1
+
+    if lut_np is not None:
+        ok = arr >= 0
+        arr[ok] = lut_np[arr[ok]]
+
+    # sentinel count in window [w, w+n) == csum[w+n] - csum[w]
+    sent = arr == -1
+    csum = np.zeros(len(arr) + 1, dtype=np.int64)
+    np.cumsum(sent, out=csum[1:])
+
+    max_np_n = 1
+    while v ** (max_np_n + 1) < 2**62:
+        max_np_n += 1
+
+    for n, ng in stats.by_n.items():
+        m = len(arr) - n + 1
+        if m <= 0:
+            continue
+        if n > max_np_n:  # int64 overflow -- slow path
+            _count_n_python(encs, ng, v, merge_lut)
+            continue
+        keys = arr[:m].copy()
+        for off in range(1, n):
+            keys *= v
+            keys += arr[off : off + m]
+        valid = (csum[n : n + m] - csum[:m]) == 0  # window has no sentinel
+        keys = keys[valid]
+        if keys.size:
+            uniq, cnt = np.unique(keys, return_counts=True)
+            ng.counter.update(dict(zip(uniq.tolist(), cnt.tolist())))
+            ng.total += int(keys.size)
+
+
+def _count_n_python(encs, ng: NGramStats, v: int, lut: list[int] | None) -> None:
+    """Fallback per-encoding counting for n too large for int64 packing."""
+    remap = lut.__getitem__ if lut is not None else None
     for enc in encs:
         ids = list(map(remap, enc.ids)) if remap is not None else enc.ids
-        for n, ng in stats.by_n.items():
-            if len(ids) < n:
-                continue
-            ng.counter.update(pack(ids[i : i + n], v) for i in range(len(ids) - n + 1))
-            ng.total += len(ids) - n + 1
+        if len(ids) < ng.n:
+            continue
+        ng.counter.update(pack(ids[i : i + ng.n], v) for i in range(len(ids) - ng.n + 1))
+        ng.total += len(ids) - ng.n + 1
 
 
 def coverage_table(ng: NGramStats) -> list[tuple[float, int]]:
