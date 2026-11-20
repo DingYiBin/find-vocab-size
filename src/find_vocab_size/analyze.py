@@ -164,12 +164,18 @@ def analyze(
     seed: int = 42,
     chat_template: bool = False,
     turns: str = "all",  # all | assistant | user
+    apply_merge: Path | None = None,
 ) -> Stats:
     from tokenizers import Tokenizer
 
     tok = Tokenizer.from_file(str(tokenizer_path))
     v = tok.get_vocab_size(with_added_tokens=True)
     stats = Stats(n_docs=0, tokenizer_vocab=v, by_n={n: NGramStats(n=n) for n in ngrams}, tok=tok)
+
+    merge_map: dict[int, int] | None = None
+    if apply_merge is not None:
+        data = json.loads(Path(apply_merge).read_text())
+        merge_map = {int(k): int(v_) for k, v_ in data["map"].items()}
 
     hf_tok = None
     if chat_template:
@@ -211,10 +217,10 @@ def analyze(
         batch.extend(texts)
         stats.n_docs += 1
         if len(batch) >= batch_size:
-            _count_batch(tok, batch, stats, v)
+            _count_batch(tok, batch, stats, v, merge_map)
             batch = []
     if batch:
-        _count_batch(tok, batch, stats, v)
+        _count_batch(tok, batch, stats, v, merge_map)
     if n_skipped:
         print(
             f"[sample] kept {stats.n_docs:,} docs, skipped {n_skipped:,} (rate={sample})",
@@ -223,10 +229,11 @@ def analyze(
     return stats
 
 
-def _count_batch(tok, batch: list[str], stats: Stats, v: int) -> None:
+def _count_batch(tok, batch: list[str], stats: Stats, v: int, merge_map: dict[int, int] | None) -> None:
     encs = tok.encode_batch(batch, add_special_tokens=False)
+    get = merge_map.get if merge_map is not None else None
     for enc in encs:
-        ids = enc.ids
+        ids = [get(i, i) for i in enc.ids] if get else enc.ids
         for n, ng in stats.by_n.items():
             if len(ids) < n:
                 continue
@@ -359,6 +366,13 @@ def main(argv: list[str] | None = None) -> None:
         "With a turn filter each turn is a separate document, so n-grams never span turns "
         "(default: all)",
     )
+    parser.add_argument(
+        "--apply-merge",
+        type=Path,
+        default=None,
+        help="Path to vocab_merge_map.json (from find-vocab-merge): remap token ids to "
+        "canonical ids BEFORE counting, so all stats reflect the compressed key space",
+    )
     args = parser.parse_args(argv)
 
     if not args.dataset.exists():
@@ -367,6 +381,8 @@ def main(argv: list[str] | None = None) -> None:
         parser.error(f"Tokenizer not found: {args.tokenizer}")
     if not 0 < args.sample <= 1:
         parser.error("--sample must be in (0, 1]")
+    if args.apply_merge is not None and not args.apply_merge.exists():
+        parser.error(f"--apply-merge map not found: {args.apply_merge}")
 
     try:
         ngrams = sorted({int(x) for x in args.ngrams.split(",")})
@@ -385,11 +401,18 @@ def main(argv: list[str] | None = None) -> None:
         seed=args.seed,
         chat_template=args.chat_template,
         turns=args.turns,
+        apply_merge=args.apply_merge,
     )
 
     print(f"\n=== Dataset: {args.dataset.name} ===")
     if args.chat_template:
         print("chat template:  APPLIED (Qwen3 template, add_generation_prompt=False)")
+    if args.apply_merge is not None:
+        n_merged = len(json.loads(args.apply_merge.read_text())["map"])
+        print(
+            f"vocab merge:    APPLIED ({n_merged:,} ids remapped -> "
+            f"effective vocab {stats.tokenizer_vocab - n_merged:,})"
+        )
     if args.turns != "all":
         print(f"turns filter:  {args.turns} only (each turn = one document)")
     if args.sample < 1.0:
