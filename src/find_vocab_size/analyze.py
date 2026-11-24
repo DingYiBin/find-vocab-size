@@ -156,7 +156,7 @@ def _to_messages(obj) -> list[dict] | None:
 
 
 def analyze(
-    path: Path,
+    paths: Path | list[Path],
     tokenizer_path: Path,
     text_field: str | None,
     ngrams: list[int] = (1, 2, 3),
@@ -210,9 +210,17 @@ def analyze(
             for c in sel
         ]
 
+    if isinstance(paths, (str, Path)):
+        paths = [Path(paths)]
+    paths = [Path(p) for p in paths]
+
+    def docs_iter():
+        for p in paths:
+            yield from iter_objects(p)
+
     rng = random.Random(seed)  # deterministic sampling
     n_skipped = 0
-    pbar = tqdm(iter_objects(path), desc="Tokenizing", unit="doc", file=sys.stderr)
+    pbar = tqdm(docs_iter(), desc="Tokenizing", unit="doc", file=sys.stderr)
     batch: list[str] = []
     for obj in pbar:
         texts = render_one(obj)
@@ -401,7 +409,12 @@ def main(argv: list[str] | None = None) -> None:
         prog="find-vocab-size",
         description="Analyze token/n-gram coverage of a dataset to choose an engram size (Qwen3-4B tokenizer).",
     )
-    parser.add_argument("dataset", type=Path, help="Dataset file: .jsonl / .jsonl.gz / .json / .txt")
+    parser.add_argument(
+        "dataset",
+        type=Path,
+        nargs="+",
+        help="One or more dataset files: .jsonl / .jsonl.gz / .json / .txt (stats are combined)",
+    )
     parser.add_argument("--text-field", default=None, help="JSON field holding the text (default: concat all string fields)")
     parser.add_argument("--tokenizer", type=Path, default=DEFAULT_TOKENIZER, help="Path to tokenizer.json")
     parser.add_argument(
@@ -439,8 +452,9 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
 
-    if not args.dataset.exists():
-        parser.error(f"Dataset not found: {args.dataset}")
+    missing = [p for p in args.dataset if not p.exists()]
+    if missing:
+        parser.error(f"Dataset file(s) not found: {', '.join(str(p) for p in missing)}")
     if not args.tokenizer.exists():
         parser.error(f"Tokenizer not found: {args.tokenizer}")
     if not 0 < args.sample <= 1:
@@ -468,7 +482,13 @@ def main(argv: list[str] | None = None) -> None:
         apply_merge=args.apply_merge,
     )
 
-    print(f"\n=== Dataset: {args.dataset.name} ===")
+    if len(args.dataset) == 1:
+        print(f"\n=== Dataset: {args.dataset[0].name} ===")
+    else:
+        names = ", ".join(p.name for p in args.dataset)
+        if len(names) > 100:
+            names = names[:97] + "..."
+        print(f"\n=== Datasets ({len(args.dataset)} files, combined): {names} ===")
     if args.chat_template:
         print("chat template:  APPLIED (Qwen3 template, add_generation_prompt=False)")
     if args.apply_merge is not None:
