@@ -137,6 +137,9 @@ def main(argv: list[str] | None = None) -> None:
     # per-n occurrences and hits at each threshold
     occ = {n: 0 for n in ngrams}
     hits = {n: {t: 0 for t in HIT_THRESHOLDS} for n in ngrams}
+    # distribution of hits across REFERENCE frequency buckets [2^k, 2^(k+1))
+    bucket_hits: dict[int, Counter[int]] = {n: Counter() for n in ngrams}  # k -> eval occurrences
+    miss_occ = {n: 0 for n in ngrams}
     per_resp: dict[int, list[tuple[str, int, int, int]]] = {n: [] for n in ngrams}  # (uid, occ, hit>=1, hit>=2)
     n_resp = 0
     n_resp_tokens = 0
@@ -165,6 +168,8 @@ def main(argv: list[str] | None = None) -> None:
                 h2 = sum(1 for c in counts if c >= 2)
                 for t in HIT_THRESHOLDS:
                     hits[n][t] += sum(1 for c in counts if c >= t)
+                bucket_hits[n].update(c.bit_length() - 1 for c in counts if c > 0)
+                miss_occ[n] += len(klist) - h1
                 eval_counter[n].update(klist)
                 if klist:
                     per_resp[n].append((uid, len(klist), h1, h2))
@@ -223,6 +228,24 @@ def main(argv: list[str] | None = None) -> None:
             rate = hits[n][t] / occ[n] if occ[n] else None
             row += f"  {fmt_pct(rate):>8}"
         print(row)
+
+    print(f"\n=== Hit distribution by REFERENCE frequency bucket (count in [2^k, 2^(k+1))) ===")
+    for n in ngrams:
+        if occ[n] == 0:
+            continue
+        bc = bucket_hits[n]
+        kmax = max(bc) if bc else -1
+        print(f"  n={n}  ({occ[n]:,} eval occurrences):")
+        print(f"  {'ref bucket':>26} {'eval occ':>10} {'% of eval':>10} {'cum hit@>=lo':>13}")
+        print(f"  {'missed (ref count = 0)':>26} {miss_occ[n]:>10,} {fmt_pct(miss_occ[n] / occ[n]):>10}")
+        cum = occ[n] - miss_occ[n]  # occurrences with ref count >= 1
+        for k in range(kmax + 1):
+            c_k = bc.get(k, 0)
+            lo = 1 << k
+            print(
+                f"  [{lo:>9,}, {lo << 1:>9,}) {c_k:>10,} {fmt_pct(c_k / occ[n]):>10} {fmt_pct(cum / occ[n]):>13}"
+            )
+            cum -= c_k
 
     for n in ngrams:
         if not per_resp[n]:
