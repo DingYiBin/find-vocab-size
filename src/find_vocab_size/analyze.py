@@ -51,14 +51,11 @@ class Stats:
     tokenizer_vocab: int
     by_n: dict[int, NGramStats]  # n -> stats
     tok: object = field(repr=False, default=None)  # Tokenizer, kept for decoding top n-grams
-
-    @property
-    def total_tokens(self) -> int:
-        return self.by_n[1].total
+    total_tokens: int = 0  # raw token count across all docs
 
     @property
     def unique_tokens(self) -> int:
-        return self.by_n[1].unique
+        return self.by_n[1].unique if 1 in self.by_n else 0
 
 
 def pack(ids: list[int], v: int) -> int:
@@ -74,6 +71,53 @@ def unpack(key: int, n: int, v: int) -> list[int]:
         ids[i] = key % v
         key //= v
     return ids
+
+
+def dump_stats(stats: "Stats", path: Path, meta: dict) -> None:
+    """Persist the n-gram inventory to a compressed .npz for later reuse.
+
+    One keys_{n}/counts_{n} array pair per n-gram level (sorted by key for
+    better compression), plus a uint8-encoded JSON `meta` blob with the
+    build options. Load with `load_stats`.
+    """
+    arrays: dict[str, np.ndarray] = {}
+    for n, ng in stats.by_n.items():
+        if not ng.counter:
+            continue
+        items = sorted(ng.counter.items())  # sorted keys compress better
+        keys, counts = zip(*items)
+        cnt = np.asarray(counts, dtype=np.int64)
+        if cnt.size and int(cnt.max()) < 2**31:
+            cnt = cnt.astype(np.int32)
+        arrays[f"keys_{n}"] = np.asarray(keys, dtype=np.int64)
+        arrays[f"counts_{n}"] = cnt
+    arrays["meta"] = np.frombuffer(json.dumps(meta, ensure_ascii=False).encode("utf-8"), dtype=np.uint8)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(path, **arrays)
+
+
+def load_stats(path: Path, tokenizer: object = None) -> tuple["Stats", dict]:
+    """Load an inventory dumped by dump_stats. Returns (Stats, meta)."""
+    data = np.load(path, allow_pickle=False)
+    meta = json.loads(data["meta"].tobytes().decode("utf-8"))
+    tok = tokenizer
+    if tok is None and meta.get("tokenizer"):
+        from tokenizers import Tokenizer
+
+        p = Path(meta["tokenizer"])
+        tok = Tokenizer.from_file(str(p)) if p.exists() else None
+    by_n: dict[int, NGramStats] = {}
+    for name in data.files:
+        if not name.startswith("keys_"):
+            continue
+        n = int(name.split("_", 1)[1])
+        keys = data[name].tolist()
+        counts = data[f"counts_{n}"].tolist()
+        ng = NGramStats(n=n, total=int(sum(counts)))
+        ng.counter = Counter(dict(zip(keys, counts)))
+        by_n[n] = ng
+    stats = Stats(n_docs=meta.get("n_docs", 0), tokenizer_vocab=meta["vocab_size"], by_n=by_n, tok=tok)
+    return stats, meta
 
 
 def iter_objects(path: Path):
@@ -261,6 +305,7 @@ def _count_batch(tok, batch: list[str], stats: Stats, v: int, merge_lut, lut_np)
     total = sum(len(e.ids) for e in encs)
     if total == 0:
         return
+    stats.total_tokens += total
     arr = np.empty(total + len(encs), dtype=np.int64)  # + 1 sentinel per doc
     pos = 0
     for e in encs:
@@ -450,6 +495,14 @@ def main(argv: list[str] | None = None) -> None:
         help="Path to vocab_merge_map.json (from find-vocab-merge): remap token ids to "
         "canonical ids BEFORE counting, so all stats reflect the compressed key space",
     )
+    parser.add_argument(
+        "--dump",
+        type=Path,
+        default=None,
+        metavar="INVENTORY.npz",
+        help="Save the n-gram inventory to a compressed .npz (keys+counts+meta) "
+        "for reuse, e.g. by find-vocab-hit --load",
+    )
     args = parser.parse_args(argv)
 
     missing = [p for p in args.dataset if not p.exists()]
@@ -504,7 +557,8 @@ def main(argv: list[str] | None = None) -> None:
     print(f"documents:      {stats.n_docs:,}")
     print(f"total tokens:   {stats.total_tokens:,}")
     print(f"tokenizer vocab: {stats.tokenizer_vocab:,}")
-    print(f"unique tokens:  {stats.unique_tokens:,}")
+    if 1 in stats.by_n:
+        print(f"unique tokens:  {stats.unique_tokens:,}")
 
     for n in ngrams:
         report_ngram(stats.by_n[n], stats)
@@ -516,6 +570,26 @@ def main(argv: list[str] | None = None) -> None:
             if level in (0.9, 0.95, 0.99):
                 pow2 = 1 << (cnt - 1).bit_length() if cnt > 0 else 0
                 print(f"  {n}-gram cover {level * 100:.0f}%: {cnt:,} entries -> {pow2:,}")
+
+    if args.dump is not None:
+        dump_stats(
+            stats,
+            args.dump,
+            {
+                "tokenizer": str(args.tokenizer),
+                "vocab_size": stats.tokenizer_vocab,
+                "files": [str(p) for p in args.dataset],
+                "n_docs": stats.n_docs,
+                "total_tokens": stats.total_tokens,
+                "ngrams": ngrams,
+                "chat_template": bool(args.chat_template),
+                "turns": args.turns,
+                "sample": args.sample,
+                "merge": str(args.apply_merge) if args.apply_merge else None,
+                "per_n_totals": {n: stats.by_n[n].total for n in stats.by_n},
+            },
+        )
+        print(f"\n>> inventory saved to {args.dump} ({args.dump.stat().st_size / 1e6:.1f} MB)")
 
 
 if __name__ == "__main__":

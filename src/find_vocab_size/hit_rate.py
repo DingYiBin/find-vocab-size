@@ -54,7 +54,14 @@ def main(argv: list[str] | None = None) -> None:
         description="Check how well n-grams from a reference corpus cover model responses "
         "(built on the find-vocab-size pipeline).",
     )
-    parser.add_argument("refs", type=Path, nargs="+", help="Reference dataset file(s) to build the n-gram inventory from")
+    parser.add_argument("refs", type=Path, nargs="*", help="Reference dataset file(s) to build the n-gram inventory from (or use --load)")
+    parser.add_argument(
+        "--load",
+        type=Path,
+        default=None,
+        metavar="INVENTORY.npz",
+        help="Load a pre-built inventory (from find-vocab-size --dump) instead of rebuilding from refs",
+    )
     parser.add_argument("--eval", type=Path, required=True, help="Eval jsonl whose FIELD (default: content) holds model responses")
     parser.add_argument("--field", default="content", help="JSON field holding the response text (default: content)")
     parser.add_argument("--id-field", default="unique_id", help="Field identifying each response in reports (default: unique_id)")
@@ -74,6 +81,10 @@ def main(argv: list[str] | None = None) -> None:
         parser.error(f"Eval file not found: {args.eval}")
     if not args.tokenizer.exists():
         parser.error(f"Tokenizer not found: {args.tokenizer}")
+    if args.load is not None and args.refs:
+        parser.error("Provide either reference file(s) or --load INVENTORY.npz, not both")
+    if args.load is None and not args.refs:
+        parser.error("Provide reference file(s) or --load INVENTORY.npz")
 
     try:
         ngrams = sorted({int(x) for x in args.ngrams.split(",")})
@@ -82,17 +93,34 @@ def main(argv: list[str] | None = None) -> None:
     except ValueError:
         parser.error("--ngrams must be comma-separated ints in [2, 3]")
 
-    # ---- 1. reference inventory (same pipeline as find-vocab-size) ----
-    # include n=1 so Stats.total_tokens works; only requested n are reported
-    ref_stats: Stats = analyze(
-        args.refs,
-        args.tokenizer,
-        text_field=None,
-        ngrams=sorted({1, *ngrams}),
-        chat_template=args.chat_template,
-        turns=args.turns,
-        apply_merge=args.apply_merge,
-    )
+    # ---- 1. reference inventory: build from refs, or load a saved one ----
+    if args.load is not None:
+        from find_vocab_size.analyze import load_stats
+
+        ref_stats, ref_meta = load_stats(args.load)
+        # consistency checks against the loaded build options
+        inv_merge = ref_meta.get("merge")
+        want_merge = str(args.apply_merge) if args.apply_merge else None
+        if inv_merge != want_merge:
+            parser.error(
+                f"--apply-merge mismatch with inventory: built with merge={inv_merge}, "
+                f"you passed {want_merge}. Keys would not be comparable; align the flags."
+            )
+        for n in ngrams:
+            if n not in ref_stats.by_n:
+                parser.error(f"Inventory lacks {n}-gram stats (built with ngrams={ref_meta.get('ngrams')})")
+    else:
+        # include n=1 so Stats.total_tokens works; only requested n are reported
+        ref_stats: Stats = analyze(
+            args.refs,
+            args.tokenizer,
+            text_field=None,
+            ngrams=sorted({1, *ngrams}),
+            chat_template=args.chat_template,
+            turns=args.turns,
+            apply_merge=args.apply_merge,
+        )
+        ref_meta = None
 
     # ---- 2. tokenize eval responses directly ----
     tok = Tokenizer.from_file(str(args.tokenizer))
@@ -167,10 +195,17 @@ def main(argv: list[str] | None = None) -> None:
 
     # ---- 3. report ----
     print(f"\n=== Reference inventory (engram source) ===")
-    print(f"files:           {len(args.refs)} ({', '.join(p.name for p in args.refs) if len(args.refs) <= 5 else '...'})")
-    print(f"options:         chat_template={args.chat_template}, turns={args.turns}, merge={bool(args.apply_merge)}")
-    print(f"documents:       {ref_stats.n_docs:,}")
-    print(f"total tokens:    {ref_stats.total_tokens:,}")
+    if args.load is not None:
+        print(f"inventory:       {args.load.name} (pre-built)")
+        print(f"built from:      {', '.join(Path(f).name for f in ref_meta.get('files', [])) if ref_meta.get('files') else 'n/a'}")
+        print(f"options:         chat_template={ref_meta.get('chat_template')}, turns={ref_meta.get('turns')}, merge={ref_meta.get('merge')}")
+        print(f"documents:       {ref_meta.get('n_docs', 0):,}")
+        print(f"total tokens:    {ref_meta.get('total_tokens', 0):,}")
+    else:
+        print(f"files:           {len(args.refs)} ({', '.join(p.name for p in args.refs) if len(args.refs) <= 5 else '...'})")
+        print(f"options:         chat_template={args.chat_template}, turns={args.turns}, merge={bool(args.apply_merge)}")
+        print(f"documents:       {ref_stats.n_docs:,}")
+        print(f"total tokens:    {ref_stats.total_tokens:,}")
     for n in ngrams:
         print(f"unique {n}-grams:  {ref_stats.by_n[n].unique:,}")
 
