@@ -82,6 +82,60 @@ def head_metrics(mixed: np.ndarray, counts: np.ndarray, C: int) -> dict:
     }
 
 
+def collision_freq_stats(mixed: np.ndarray, counts: np.ndarray, C: int) -> dict:
+    """Frequency-weighted collision damage stats for one head.
+
+    contamination(k) = 1 - count_k / mass(bucket_k): share of an n-gram's
+    bucket mass that belongs to OTHER n-grams -- occurrence-weighted this is
+    the expected dilution a random hit suffers.
+    """
+    bucket = mixed % C
+    own = counts.astype(np.float64)
+    mass_per = np.bincount(bucket, weights=own, minlength=C)
+    bmass = mass_per[bucket]
+    contam = 1.0 - own / bmass
+    weighted_contam = float((contam * own).sum() / own.sum())
+
+    # top-1 dominance: share of bucket mass held by its largest n-gram
+    order = np.lexsort((-own, bucket))
+    bs = bucket[order]
+    starts = np.nonzero(np.r_[True, bs[1:] != bs[:-1]])[0]
+    top1 = np.zeros(C)
+    top1[bs[starts]] = own[order][starts]
+    top1_share = top1[bucket] / bmass
+    # weighted p50 of top1_share over occurrences
+    w = own / own.sum()
+    srt = np.argsort(top1_share)
+    cw = np.cumsum(w[srt])
+    p50 = float(top1_share[srt][np.searchsorted(cw, 0.5)])
+    mean_top1 = float((top1_share * own).sum() / own.sum())
+
+    # neighbor mass distribution: other-mass = bmass - own, occurrence-weighted
+    other = bmass - own
+    kmax = int(int(other.max())).bit_length() if other.size else 0
+    hist = []
+    for k in range(kmax + 1):
+        lo = (1 << k) - 1 if k else 0  # bucket [0,1) = no neighbor
+        hi = 1 << k if k else 1
+        m = (other >= lo) & (other < hi) if k else (other == 0)
+        hist.append((k, float(own[m].sum())))
+
+    # worst buckets by SECOND-largest member count (high-freq x high-freq)
+    second = np.zeros(C)
+    has_second = np.diff(starts, append=len(bs)) > 1
+    second[bs[starts][has_second]] = own[order][starts[has_second] + 1]
+    worst_second = np.argsort(-second)[:10]
+    return {
+        "bucket": bucket,
+        "weighted_contam": weighted_contam,
+        "mean_top1": mean_top1,
+        "p50_top1": p50,
+        "hist": hist,
+        "second": second,
+        "worst_second": [int(b) for b in worst_second if second[b] > 0],
+    }
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="find-engram-collision",
@@ -166,6 +220,33 @@ def main(argv: list[str] | None = None) -> None:
         print("  distinct@risk: % of distinct n-grams sharing a bucket with another n-gram")
         print("  occ@risk:      % of occurrences landing in a bucket shared by >1 n-gram")
         print("  P(pair):       probability two occurrence-weighted draws hit the same bucket")
+
+        # frequency-weighted collision damage (head 0; heads differ only by C)
+        fs = collision_freq_stats(mixed, counts, counts_c[0])
+        print(f"\n  === Collision frequency stats ({label.split()[0]}, head 0) ===")
+        print(f"  weighted contamination:  {fs['weighted_contam'] * 100:.2f}%   "
+              f"(expected share of bucket mass belonging to OTHER n-grams, per occurrence)")
+        print(f"  top-1 dominance:         mean {fs['mean_top1'] * 100:.2f}%  "
+              f"p50 {fs['p50_top1'] * 100:.2f}%   (share of bucket mass held by its largest n-gram)")
+        print(f"\n  Neighbor-mass distribution (other n-grams' mass in the hit bucket, occurrence-weighted):")
+        total_mass = float(counts.sum())
+        nonzero_k = [k for k, _ in fs["hist"] if k > 0]
+        for k, m_k in fs["hist"]:
+            if m_k <= 0 and (k > 0 or not nonzero_k):
+                continue
+            tag = "no collision (own bucket)" if k == 0 else f"other mass [{1 << (k-1):,}, {1 << k:,})"
+            print(f"    {tag:>34} {m_k:>16,.0f}  {100.0 * m_k / total_mass:>7.2f}% of occurrences")
+
+        if tok is not None and fs["worst_second"]:
+            print(f"\n  Worst high-freq x high-freq buckets (ranked by 2nd-largest member count):")
+            for b in fs["worst_second"][: args.top_buckets]:
+                members = np.where(fs["bucket"] == b)[0]
+                members = members[np.argsort(-counts[members])]
+                print(f"    bucket {b:,} (2nd member: {int(fs['second'][b]):,}x):")
+                for idx in members[: args.examples]:
+                    ids = [int(c[idx]) for c in cols]
+                    print(f"      {int(counts[idx]):>11,}x  {tok.decode(ids)!r}")
+
 
         # worst buckets for the FIRST head of this order (heads differ only by C)
         if tok is not None and args.top_buckets > 0:
